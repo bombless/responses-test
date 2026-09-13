@@ -1,9 +1,25 @@
 #!/usr/bin/env node
 
+const fs = require('node:fs/promises');
 const keytar = require('keytar');
 const readline = require('node:readline');
 
 const SERVICE = 'responses-test';
+
+const TOOLS = [
+  {
+    type: 'function',
+    name: 'list_dir',
+    description: 'List the file and directory names in the current working directory.',
+    strict: true,
+    parameters: {
+      type: 'object',
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    },
+  },
+];
 
 async function getConfig() {
   const [key, url, model] = await Promise.all([
@@ -64,10 +80,29 @@ function extractText(response) {
   return parts.join('');
 }
 
+function getFunctionCalls(response) {
+  return (response.output ?? []).filter((item) => item.type === 'function_call');
+}
+
+async function executeTool(call) {
+  if (call.name !== 'list_dir') {
+    throw new Error(`Unknown tool: ${call.name}`);
+  }
+
+  // Deliberately expose only the current working directory; the model cannot
+  // supply an arbitrary path.
+  const names = await fs.readdir(process.cwd());
+  return {
+    cwd: process.cwd(),
+    names,
+  };
+}
+
 async function request(config, input, previousResponseId) {
   const body = {
     model: config.model,
     input,
+    tools: TOOLS,
   };
 
   if (previousResponseId) {
@@ -103,8 +138,40 @@ async function request(config, input, previousResponseId) {
   return data;
 }
 
+async function runConversation(config, input) {
+  let response = await request(config, input);
+
+  // Keep resolving tool calls until the model produces a final response.
+  while (true) {
+    const calls = getFunctionCalls(response);
+    if (calls.length === 0) {
+      return response;
+    }
+
+    const outputs = [];
+    for (const call of calls) {
+      let output;
+      try {
+        // Validate that the model sent valid JSON even though list_dir takes no args.
+        JSON.parse(call.arguments || '{}');
+        output = await executeTool(call);
+      } catch (error) {
+        output = { error: error.message };
+      }
+
+      outputs.push({
+        type: 'function_call_output',
+        call_id: call.call_id,
+        output: JSON.stringify(output),
+      });
+    }
+
+    response = await request(config, outputs, response.id);
+  }
+}
+
 async function singleTurn(config, prompt) {
-  const response = await request(config, prompt);
+  const response = await runConversation(config, prompt);
   const output = extractText(response);
   if (!output) {
     throw new Error('The response contains no text output.');
@@ -134,7 +201,31 @@ async function interactive(config) {
     }
 
     try {
-      const response = await request(config, prompt, previousResponseId);
+      let response = await request(config, prompt, previousResponseId);
+
+      while (true) {
+        const calls = getFunctionCalls(response);
+        if (calls.length === 0) break;
+
+        const outputs = [];
+        for (const call of calls) {
+          let output;
+          try {
+            JSON.parse(call.arguments || '{}');
+            output = await executeTool(call);
+          } catch (error) {
+            output = { error: error.message };
+          }
+          outputs.push({
+            type: 'function_call_output',
+            call_id: call.call_id,
+            output: JSON.stringify(output),
+          });
+        }
+
+        response = await request(config, outputs, response.id);
+      }
+
       const output = extractText(response);
       if (!output) {
         console.log('[No text output]');
